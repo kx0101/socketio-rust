@@ -1,6 +1,8 @@
+mod state;
+
 use axum::{extract::State, routing::get};
 use socketioxide::{
-    extract::{Data, SocketRef},
+    extract::{Data, SocketRef, State as SocketState},
     SocketIo,
 };
 use tower::ServiceBuilder;
@@ -15,33 +17,39 @@ struct MessageIn {
 }
 
 #[derive(serde::Serialize)]
-struct MessageOut {
-    text: String,
-    user: String,
-    date: chrono::DateTime<chrono::Utc>,
+struct Messages {
+    messages: Vec<state::Message>,
 }
 
 async fn on_connect(socket: SocketRef) {
     info!("socket connected: {}", socket.id);
 
-    socket.on("join", |socket: SocketRef, Data::<String>(room)| {
+    socket.on("join", |socket: SocketRef, Data::<String>(room), store: SocketState<state::MessageStore>| async move {
         info!("Received join: {:?}", room);
 
         let _ = socket.leave_all();
-        let _ = socket.join(room);
+        let _ = socket.join(room.clone());
+
+        let messages = store.get(&room).await;
+        let _ = socket.emit("messages", Messages { messages } );
     });
 
-    socket.on("message", |socket: SocketRef, Data::<MessageIn>(data)| {
-        info!("Received message: {:?}", data);
+    socket.on(
+        "message",
+        |socket: SocketRef, Data::<MessageIn>(data), store: SocketState<state::MessageStore>| async move {
+            info!("Received message: {:?}", data);
 
-        let response = MessageOut {
-            text: data.text,
-            user: format!("user-{}", socket.id),
-            date: chrono::Utc::now(),
-        };
+            let response = state::Message {
+                text: data.text,
+                user: format!("user-{}", socket.id),
+                date: chrono::Utc::now(),
+            };
 
-        let _ = socket.within(data.room).emit("message", response);
-    })
+            store.insert(&data.room, response.clone()).await;
+
+            let _ = socket.within(data.room).emit("message", response);
+        },
+    )
 }
 
 async fn handler(State(io): State<SocketIo>) {
@@ -52,7 +60,8 @@ async fn handler(State(io): State<SocketIo>) {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(FmtSubscriber::default())?;
 
-    let (layer, io) = SocketIo::new_layer();
+    let messages = state::MessageStore::default();
+    let (layer, io) = SocketIo::builder().with_state(messages).build_layer();
 
     io.ns("/", on_connect);
 
